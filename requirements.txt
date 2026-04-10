@@ -7,6 +7,7 @@ numpy>=1.24.0
 
 # File format support
 openpyxl>=3.1.0        # Excel (.xlsx) read/write
+xlrd>=2.0.1            # Legacy Excel (.xls) read
 pyreadstat>=1.2.0      # SAS (.sas7bdat, .xpt) read
 
 # LLM integration
