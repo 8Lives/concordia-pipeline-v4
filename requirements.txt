@@ -15,6 +15,7 @@ anthropic>=0.39.0      # Claude API
 
 # Document parsing (for data dictionaries)
 python-docx>=0.8.11    # Word document parsing
+pdfplumber>=0.10.0     # PDF table extraction for PDF data dictionaries
 
 # UI
 streamlit>=1.30.0      # Interactive web interface
