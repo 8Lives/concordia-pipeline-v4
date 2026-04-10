@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Dict
 import json
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -447,6 +448,304 @@ def parse_data_dictionary(df: pd.DataFrame) -> Dict:
     return dictionary
 
 
+def parse_pdf_dictionary(pdf_file) -> Dict:
+    """
+    Parse a PDF data dictionary using pdfplumber table extraction.
+
+    Handles two common formats:
+    1. Tabular dictionaries (e.g., Amgen_265) with structured tables containing
+       Variable Name, Variable Label, Type/Length, Decodes/Format, Origin, etc.
+    2. Text-only PDFs (e.g., Merck_188) that contain no extractable tables.
+
+    Returns the same dict format as parse_data_dictionary:
+    {
+        "SEX": {"codes": {"1": "Male", "2": "Female"}},
+        "RACE": {"codes": {"11": "White", "12": "Black or African American"}}
+    }
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber not installed — cannot parse PDF dictionaries")
+        return {}
+
+    dictionary = {}
+    all_rows = []
+
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            logger.info(f"PDF has {len(pdf.pages)} pages")
+
+            for page_num, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                for table in tables:
+                    if table:
+                        all_rows.extend(table)
+
+            if not all_rows:
+                # Fallback: try extracting text and parsing with regex
+                logger.info("No tables found in PDF — trying text extraction")
+                full_text = ""
+                for page in pdf.pages:
+                    full_text += (page.extract_text() or "") + "\n"
+
+                if not full_text.strip():
+                    logger.warning("PDF contains no extractable text or tables")
+                    return {}
+
+                return _parse_pdf_text_dictionary(full_text)
+
+    except Exception as e:
+        logger.exception(f"Failed to read PDF: {e}")
+        return {}
+
+    if not all_rows:
+        return {}
+
+    # Identify header row and column positions
+    header_idx, col_indices = _find_pdf_table_headers(all_rows)
+
+    if header_idx is None or not col_indices.get("var_name"):
+        logger.warning("Could not identify variable name column in PDF tables")
+        # Try text-based fallback
+        try:
+            with pdfplumber.open(pdf_file) as pdf:
+                full_text = ""
+                for page in pdf.pages:
+                    full_text += (page.extract_text() or "") + "\n"
+                return _parse_pdf_text_dictionary(full_text)
+        except Exception:
+            return {}
+
+    # Parse rows after header
+    data_rows = all_rows[header_idx + 1:]
+    var_col = col_indices["var_name"]
+    decode_col = col_indices.get("decodes")
+    label_col = col_indices.get("label")
+    comment_col = col_indices.get("comments")
+
+    current_var = None
+
+    for row in data_rows:
+        if not row or len(row) <= var_col:
+            continue
+
+        # Get variable name
+        var_cell = row[var_col] if var_col < len(row) else None
+        if var_cell and str(var_cell).strip():
+            var_name = str(var_cell).strip().upper()
+            # Skip domain headers (e.g., "AE.xpt", "DM.xpt", section titles)
+            if var_name.endswith('.XPT') or var_name.startswith('DATASET'):
+                continue
+            # Skip if it looks like a column header repeated
+            if var_name in ('VARIABLE NAME', 'VARIABLE', 'VAR NAME', 'NAME'):
+                continue
+            current_var = var_name
+
+        if not current_var:
+            continue
+
+        if current_var not in dictionary:
+            dictionary[current_var] = {"codes": {}}
+
+        # Extract codes from Decodes/Format column
+        if decode_col is not None and decode_col < len(row):
+            decode_cell = row[decode_col]
+            if decode_cell and str(decode_cell).strip():
+                codes = _extract_codes_from_cell(str(decode_cell).strip())
+                dictionary[current_var]["codes"].update(codes)
+
+        # Also check Comments column for decode references
+        if comment_col is not None and comment_col < len(row):
+            comment_cell = row[comment_col]
+            if comment_cell and str(comment_cell).strip():
+                comment_str = str(comment_cell).strip()
+                # Comments like "Decode of SEXCD" don't contain codes themselves
+                # but label column might have the allowed values
+                if label_col is not None and label_col < len(row):
+                    label_cell = row[label_col]
+                    if label_cell:
+                        dictionary[current_var]["label"] = str(label_cell).strip()
+
+    # Remove variables with no codes
+    dictionary = {k: v for k, v in dictionary.items() if v.get("codes")}
+
+    # Post-processing: filter out noise entries
+    cleaned = {}
+    for var, data in dictionary.items():
+        # Skip repeated header rows that slipped through
+        if re.search(r'\s', var) and not re.search(r'[_]', var):
+            # Multi-word without underscore is likely a section header, not a variable
+            continue
+
+        codes = data.get("codes", {})
+
+        # Remove SAS format noise from code values
+        # Pattern: keys like "Follow", "$FORMAT.", "8.", "8.3", "(0", "1)"
+        noise_keys = {k for k in codes if re.match(r'^[\d.()]+$', k)
+                      or k.startswith('$')
+                      or k.lower() == 'follow'
+                      or re.match(r'^follow\s', k, re.IGNORECASE)}
+        clean_codes = {k: v for k, v in codes.items() if k not in noise_keys}
+
+        if clean_codes:
+            data["codes"] = clean_codes
+            cleaned[var] = data
+
+    dictionary = cleaned
+
+    logger.info(f"PDF parser found {len(dictionary)} variables with codes")
+    for var, data in dictionary.items():
+        codes = data.get("codes", {})
+        logger.info(f"  {var}: {len(codes)} codes - keys: {list(codes.keys())[:10]}")
+
+    return dictionary
+
+
+def _find_pdf_table_headers(rows):
+    """
+    Find the header row in PDF table rows and return column indices.
+
+    Returns (header_row_index, col_indices_dict) where col_indices_dict maps:
+    - var_name: column index for Variable Name
+    - label: column index for Variable Label
+    - decodes: column index for Decodes / Format / Valid Values
+    - comments: column index for Comments
+    """
+    header_keywords = {
+        "var_name": ["VARIABLE NAME", "VARIABLE", "VAR NAME", "NAME", "FIELD"],
+        "label": ["VARIABLE LABEL", "LABEL", "DESCRIPTION"],
+        "decodes": [
+            "DECODES / FORMAT", "DECODES/FORMAT", "DECODES",
+            "FORMAT (VALUE LIST)", "FORMAT  (VALUE LIST)",
+            "VALID VALUES", "VALUES", "CODELIST", "FORMAT",
+            "DECODE", "VALUE LIST",
+        ],
+        "comments": ["COMMENTS", "COMMENT", "NOTES", "NOTE"],
+    }
+
+    for idx, row in enumerate(rows):
+        if not row:
+            continue
+        # Normalize cells: uppercase, collapse whitespace/newlines
+        cells_upper = []
+        for c in row:
+            if c:
+                normalized = re.sub(r'\s+', ' ', str(c).strip().upper())
+                cells_upper.append(normalized)
+            else:
+                cells_upper.append("")
+
+        col_indices = {}
+        for key, candidates in header_keywords.items():
+            for col_idx, cell in enumerate(cells_upper):
+                if cell in candidates:
+                    col_indices[key] = col_idx
+                    break
+
+        if "var_name" in col_indices:
+            logger.info(f"Found PDF header at row {idx}: {col_indices}")
+            return idx, col_indices
+
+    return None, {}
+
+
+def _extract_codes_from_cell(text: str) -> Dict[str, str]:
+    """
+    Extract code-decode pairs from a Decodes/Format cell.
+
+    Handles formats like:
+    - "1=Male, 2=Female"
+    - "Y, N"
+    - "CHEILITIS, EYE, HAIR, NAIL, SKIN"
+    - "1 = Male 2 = Female"
+    - "M=Male F=Female"
+    - "Follow $FREQ" (SAS format reference — skip)
+    """
+    codes = {}
+
+    # Skip SAS format references like "$FREQ", "$SCOPE", "follow BODSYS."
+    if text.startswith('$') or text.startswith('Follow $'):
+        return codes
+
+    # Skip SAS numeric formats like "8.", "8.3", "6.", "best12."
+    if re.match(r'^(?:best)?\d+\.?\d*$', text, re.IGNORECASE):
+        return codes
+
+    # Skip "follow FORMAT." patterns (SAS format catalog references)
+    if re.match(r'^(?:follow\s+)?\w+\.\s*$', text, re.IGNORECASE):
+        return codes
+
+    # Skip mixed SAS format + follow references like "8., follow\nBODSYS."
+    cleaned = re.sub(r'\d+\.?\d*\s*,?\s*', '', text).strip()
+    if re.match(r'^(?:follow\s+)?\w+\.?\s*$', cleaned, re.IGNORECASE) and '=' not in text:
+        return codes
+
+    # Try code=decode pairs first (e.g., "1=Male, 2=Female" or "M=Male\nF=Female")
+    pairs = re.findall(r'([^,=\n]+?)\s*=\s*([^,=\n]+)', text)
+    if pairs:
+        for code, label in pairs:
+            code = code.strip()
+            label = label.strip()
+            if code and label:
+                codes[code] = label
+        return codes
+
+    # Try comma-separated list of values (e.g., "Y, N" or "CHEILITIS, EYE, HAIR")
+    if ',' in text:
+        values = [v.strip() for v in text.split(',') if v.strip()]
+        # Only treat as value list if items are short (< 40 chars) — avoid capturing descriptions
+        if values and all(len(v) < 40 for v in values):
+            for v in values:
+                codes[v] = v
+            return codes
+
+    # Try newline-separated values
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if len(lines) > 1 and all(len(l) < 40 for l in lines):
+        for l in lines:
+            # Check for "code = label" pattern in each line
+            m = re.match(r'^(\S+)\s*=\s*(.+)', l)
+            if m:
+                codes[m.group(1).strip()] = m.group(2).strip()
+            else:
+                codes[l] = l
+
+    return codes
+
+
+def _parse_pdf_text_dictionary(text: str) -> Dict:
+    """
+    Fallback: parse a PDF dictionary from raw extracted text.
+
+    Looks for patterns like:
+    - "VARIABLE_NAME: 1=Male, 2=Female"
+    - Lines with known variable names followed by code patterns
+    """
+    dictionary = {}
+
+    # Known SDTM/clinical variable names to look for
+    known_vars = [
+        "SEX", "SEXCD", "RACE", "RACECD", "ETHNIC", "ETHNICCD",
+        "COUNTRY", "ARMCD", "ARM", "AGEGP", "AGEGPCD", "AGEU",
+        "AESER", "AEREL", "AEACN", "AEOUT", "AESEV", "AETOXGR",
+        "AESCOPE", "AEFREQ",
+    ]
+
+    for var in known_vars:
+        # Pattern: VAR followed by code list on same or next line
+        pattern = rf'\b{var}\b[:\s]+((?:\d+\s*=\s*[^\n]+)(?:[,;\n]\s*\d+\s*=\s*[^\n]+)*)'
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            codes_text = match.group(1)
+            codes = _extract_codes_from_cell(codes_text)
+            if codes:
+                dictionary[var] = {"codes": codes}
+
+    logger.info(f"PDF text parser found {len(dictionary)} variables with codes")
+    return dictionary
+
+
 def init_session_state():
     """Initialize session state variables."""
     if "pipeline_result" not in st.session_state:
@@ -469,6 +768,126 @@ def progress_callback(stage: str, status: str, message: str, progress: float):
         "message": message,
         "progress": progress
     })
+
+
+def _render_knowledge_base_tree():
+    """Render the knowledge base file tree in the sidebar.
+
+    Shows each domain as an expander with categorized spec files:
+    - Variable specs (DM_SEX.md, DM_AGE.md, ...)
+    - Domain rules & plans
+    - Value sets
+    Clicking a file shows a preview snippet.
+    """
+    kb_path = Path(__file__).parent / "knowledge_base"
+    if not kb_path.exists():
+        st.caption("knowledge_base/ not found")
+        return
+
+    # Collect domains (subdirectories)
+    domains = sorted([d.name for d in kb_path.iterdir() if d.is_dir()])
+
+    # Also show top-level files (e.g., system_rules.md)
+    top_files = sorted([f.name for f in kb_path.iterdir() if f.is_file() and f.suffix == '.md'])
+
+    for domain in domains:
+        domain_path = kb_path / domain
+        md_files = sorted([f for f in domain_path.iterdir() if f.is_file() and f.suffix == '.md'])
+        value_sets_path = domain_path / "value_sets"
+        vs_files = sorted([f for f in value_sets_path.iterdir() if f.is_file() and f.suffix == '.md']) if value_sets_path.exists() else []
+
+        # Categorize files
+        var_specs = []
+        rules_plans = []
+        for f in md_files:
+            name = f.name
+            if 'domain_rules' in name or 'Specification' in name or 'Buildout' in name or 'Extraction' in name or 'Summary' in name:
+                rules_plans.append(f)
+            else:
+                var_specs.append(f)
+
+        total = len(var_specs) + len(rules_plans) + len(vs_files)
+
+        with st.expander(f"**{domain}** — {total} specs", expanded=False):
+            # Variable specs
+            if var_specs:
+                st.markdown(
+                    f'<p style="font-size:0.75rem; color:{BRAND_TEAL}; margin:4px 0 2px; '
+                    f'font-weight:600;">Variable Specs ({len(var_specs)})</p>',
+                    unsafe_allow_html=True,
+                )
+                for f in var_specs:
+                    var_name = f.stem.replace(f"{domain}_", "")
+                    if st.button(f"📄 {var_name}", key=f"kb_{domain}_{f.stem}", use_container_width=True):
+                        st.session_state[f"kb_preview_{domain}"] = str(f)
+
+            # Rules & plans
+            if rules_plans:
+                st.markdown(
+                    f'<p style="font-size:0.75rem; color:{BRAND_PURPLE}; margin:8px 0 2px; '
+                    f'font-weight:600;">Rules & Plans ({len(rules_plans)})</p>',
+                    unsafe_allow_html=True,
+                )
+                for f in rules_plans:
+                    label = f.stem.replace(f"{domain}_", "").replace("_", " ")
+                    if st.button(f"📋 {label}", key=f"kb_{domain}_{f.stem}", use_container_width=True):
+                        st.session_state[f"kb_preview_{domain}"] = str(f)
+
+            # Value sets
+            if vs_files:
+                st.markdown(
+                    f'<p style="font-size:0.75rem; color:{BRAND_BLUE}; margin:8px 0 2px; '
+                    f'font-weight:600;">Value Sets ({len(vs_files)})</p>',
+                    unsafe_allow_html=True,
+                )
+                for f in vs_files:
+                    label = f.stem.replace("_values", "").replace("_", " ").title()
+                    if st.button(f"📊 {label}", key=f"kb_vs_{domain}_{f.stem}", use_container_width=True):
+                        st.session_state[f"kb_preview_{domain}"] = str(f)
+
+            # Preview pane
+            preview_key = f"kb_preview_{domain}"
+            if preview_key in st.session_state and st.session_state[preview_key]:
+                preview_path = Path(st.session_state[preview_key])
+                if preview_path.exists():
+                    st.divider()
+                    content = preview_path.read_text(encoding="utf-8")
+                    # Show first ~40 lines as a preview
+                    lines = content.split("\n")
+                    preview_text = "\n".join(lines[:40])
+                    if len(lines) > 40:
+                        preview_text += f"\n\n*... ({len(lines) - 40} more lines)*"
+                    st.markdown(
+                        f'<div style="font-size:0.75rem; color:#C0C8D8; background:#1A1F3C; '
+                        f'padding:8px; border-radius:4px; max-height:300px; overflow-y:auto; '
+                        f'white-space:pre-wrap; font-family:monospace;">{preview_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # Top-level files
+    if top_files:
+        with st.expander(f"**System** — {len(top_files)} files", expanded=False):
+            for fname in top_files:
+                label = fname.replace(".md", "").replace("_", " ").title()
+                fpath = kb_path / fname
+                if st.button(f"⚙️ {label}", key=f"kb_sys_{fname}", use_container_width=True):
+                    st.session_state["kb_preview_system"] = str(fpath)
+
+            if "kb_preview_system" in st.session_state and st.session_state["kb_preview_system"]:
+                sys_path = Path(st.session_state["kb_preview_system"])
+                if sys_path.exists():
+                    st.divider()
+                    content = sys_path.read_text(encoding="utf-8")
+                    lines = content.split("\n")
+                    preview_text = "\n".join(lines[:40])
+                    if len(lines) > 40:
+                        preview_text += f"\n\n*... ({len(lines) - 40} more lines)*"
+                    st.markdown(
+                        f'<div style="font-size:0.75rem; color:#C0C8D8; background:#1A1F3C; '
+                        f'padding:8px; border-radius:4px; max-height:300px; overflow-y:auto; '
+                        f'white-space:pre-wrap; font-family:monospace;">{preview_text}</div>',
+                        unsafe_allow_html=True,
+                    )
 
 
 def render_sidebar():
@@ -547,6 +966,23 @@ def render_sidebar():
             unsafe_allow_html=True,
         )
 
+        # Knowledge Base Explorer
+        st.divider()
+        st.subheader("Knowledge Base")
+        st.markdown(
+            '<div style="font-family:Barlow,sans-serif; font-size:0.8rem; color:#8B9DC3; '
+            'line-height:1.5; margin-bottom:10px;">'
+            'The SpecRegistry replaces RAG with deterministic, markdown-based domain '
+            'specifications. Each variable has a dedicated spec file defining its '
+            'semantic identity, allowed values, mapping rules, and QC checks. '
+            'The pipeline loads these instantly at startup&mdash;no vector DB, '
+            'no embedding model, no retrieval latency.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        _render_knowledge_base_tree()
+
         return {
             "use_llm": use_llm,
             "enable_review": enable_review,
@@ -580,8 +1016,8 @@ def render_file_upload():
         st.caption("Upload a data dictionary to improve column mapping accuracy")
         data_dict_file = st.file_uploader(
             "Upload data dictionary",
-            type=["csv", "xlsx", "xls", "json"],
-            help="Maps source column names to descriptions or standard terms",
+            type=["csv", "xlsx", "xls", "json", "pdf"],
+            help="Maps source column names to descriptions or standard terms (tabular PDFs supported)",
             key="data_dict_uploader"
         )
 
@@ -1132,7 +1568,13 @@ def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None
     data_dict = None
     if data_dict_file is not None:
         try:
-            if data_dict_file.name.endswith('.csv'):
+            if data_dict_file.name.endswith('.pdf'):
+                data_dict = parse_pdf_dictionary(data_dict_file)
+                if data_dict:
+                    logger.info(f"Parsed PDF dictionary: {len(data_dict)} variables with codes")
+                else:
+                    st.info("PDF dictionary loaded but no code mappings were extracted.")
+            elif data_dict_file.name.endswith('.csv'):
                 dict_df = pd.read_csv(data_dict_file)
             elif data_dict_file.name.endswith('.xlsx'):
                 dict_df = pd.read_excel(data_dict_file, engine="openpyxl")
@@ -1175,7 +1617,6 @@ def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None
 
     # Extract trial_id from filename if not provided
     if not trial_id:
-        import re
         match = re.search(r'(NCT\d{8})', uploaded_file.name)
         trial_id = match.group(1) if match else Path(uploaded_file.name).stem
 
