@@ -1,0 +1,19 @@
+# Concordia Pipeline v4 - Core Dependencies
+# No RAG/embedding dependencies (chromadb, sentence-transformers, voyageai removed)
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# File format support
+openpyxl>=3.1.0        # Excel (.xlsx) read/write
+pyreadstat>=1.2.0      # SAS (.sas7bdat, .xpt) read
+
+# LLM integration
+anthropic>=0.39.0      # Claude API
+
+# Document parsing (for data dictionaries)
+python-docx>=0.8.11    # Word document parsing
+
+# UI
+streamlit>=1.30.0      # Interactive web interface
