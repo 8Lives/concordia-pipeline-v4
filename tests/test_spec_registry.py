@@ -149,7 +149,7 @@ class TestValueSetLoader:
         assert "caucasian" in lookup or '"caucasian"' in lookup
 
     def test_ethnicity_values(self):
-        vs = load_value_set(VS_DIR / "ethnicity_values.md")
+        vs = load_value_set(VS_DIR / "ethnic_values.md")
         vals = vs.get_allowed_value_list()
         assert len(vals) == 3
         assert "Hispanic or Latino" in vals
