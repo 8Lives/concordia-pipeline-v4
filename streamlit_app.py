@@ -144,6 +144,24 @@ def inject_brand_css():
     section[data-testid="stSidebar"] [data-baseweb="select"] * {
         color: #F0F0F1 !important;
     }
+    /* Sidebar select/dropdown inputs — dark bg so light text is readable */
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background-color: #2A3050 !important;
+        border-color: rgba(240,240,241,0.2) !important;
+    }
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div:hover {
+        border-color: rgba(240,240,241,0.4) !important;
+    }
+    /* Dropdown menu (popover) — also dark */
+    section[data-testid="stSidebar"] [data-baseweb="popover"] ul {
+        background-color: #2A3050 !important;
+    }
+    section[data-testid="stSidebar"] [data-baseweb="popover"] li {
+        color: #F0F0F1 !important;
+    }
+    section[data-testid="stSidebar"] [data-baseweb="popover"] li:hover {
+        background-color: #3B63A8 !important;
+    }
 
     /* ---- Primary button — brand blue ---- */
     .stButton > button[kind="primary"],
@@ -326,22 +344,39 @@ def stoplight_panel(level: str, reason: str = "",
 
 
 def pipeline_stepper(stages: list, current_index: int, failed: bool = False) -> str:
-    """Render a horizontal pipeline stage stepper."""
+    """Render a horizontal pipeline stage stepper with state-driven colors.
+
+    States:
+    - Pending (not yet reached): gray with empty circle
+    - Active (currently running): brand blue with spinner dot
+    - Complete (successfully passed): teal with checkmark
+    - Failed: red with X mark
+    """
     html = '<div style="display:flex; gap:6px; margin:16px 0;">'
     for i, stage in enumerate(stages):
         if failed and i == current_index:
-            color, bg = BRAND_RED, "#FDEDEB"
+            # Failed at this stage
+            color, bg, border = BRAND_RED, "#FDEDEB", BRAND_RED
+            icon = "✗"
         elif i < current_index:
-            color, bg = BRAND_TEAL, "#E8F5F3"
+            # Completed
+            color, bg, border = BRAND_TEAL, "#E8F5F3", BRAND_TEAL
+            icon = "✓"
         elif i == current_index:
-            color, bg = BRAND_BLUE, "#EDF2FA"
+            # Active / in-progress
+            color, bg, border = BRAND_BLUE, "#EDF2FA", BRAND_BLUE
+            icon = "●"
         else:
-            color, bg = "#9CA3AF", "#F3F4F6"
+            # Pending
+            color, bg, border = "#9CA3AF", "#F9FAFB", "#E5E7EB"
+            icon = "○"
         html += f'''
-        <div style="flex:1; text-align:center; padding:10px 4px;
-                    background:{bg}; border-radius:6px; border:1px solid {color}33;">
+        <div style="flex:1; text-align:center; padding:8px 4px;
+                    background:{bg}; border-radius:6px; border:1.5px solid {border};">
+            <div style="font-size:0.85rem; margin-bottom:2px;">{icon}</div>
             <span style="font-family:Barlow Semi Condensed,sans-serif; font-weight:600;
-                         font-size:0.75rem; color:{color}; letter-spacing:0.03em;">{stage}</span>
+                         font-size:0.7rem; color:{color}; letter-spacing:0.04em;
+                         text-transform:uppercase;">{stage}</span>
         </div>'''
     html += '</div>'
     return html
@@ -798,17 +833,20 @@ def _render_knowledge_base_tree():
 
         # Categorize files
         var_specs = []
-        rules_plans = []
+        domain_rules = []
         for f in md_files:
             name = f.name
-            if 'domain_rules' in name or 'Specification' in name or 'Buildout' in name or 'Extraction' in name or 'Summary' in name:
-                rules_plans.append(f)
+            if 'domain_rules' in name:
+                domain_rules.append(f)
             else:
                 var_specs.append(f)
 
-        total = len(var_specs) + len(rules_plans) + len(vs_files)
+        total = len(var_specs) + len(domain_rules) + len(vs_files)
 
         with st.expander(f"**{domain}** — {total} specs", expanded=False):
+            preview_key = f"kb_preview_{domain}"
+            selected_path = st.session_state.get(preview_key, "")
+
             # Variable specs
             if var_specs:
                 st.markdown(
@@ -818,20 +856,26 @@ def _render_knowledge_base_tree():
                 )
                 for f in var_specs:
                     var_name = f.stem.replace(f"{domain}_", "")
-                    if st.button(f"📄 {var_name}", key=f"kb_{domain}_{f.stem}", use_container_width=True):
-                        st.session_state[f"kb_preview_{domain}"] = str(f)
+                    is_selected = str(f) == selected_path
+                    btn_type = "primary" if is_selected else "secondary"
+                    if st.button(f"📄 {var_name}", key=f"kb_{domain}_{f.stem}", use_container_width=True, type=btn_type):
+                        st.session_state[preview_key] = str(f)
+                        st.rerun()
 
-            # Rules & plans
-            if rules_plans:
+            # Domain rules
+            if domain_rules:
                 st.markdown(
                     f'<p style="font-size:0.75rem; color:{BRAND_PURPLE}; margin:8px 0 2px; '
-                    f'font-weight:600;">Rules & Plans ({len(rules_plans)})</p>',
+                    f'font-weight:600;">Domain Rules ({len(domain_rules)})</p>',
                     unsafe_allow_html=True,
                 )
-                for f in rules_plans:
+                for f in domain_rules:
                     label = f.stem.replace(f"{domain}_", "").replace("_", " ")
-                    if st.button(f"📋 {label}", key=f"kb_{domain}_{f.stem}", use_container_width=True):
-                        st.session_state[f"kb_preview_{domain}"] = str(f)
+                    is_selected = str(f) == selected_path
+                    btn_type = "primary" if is_selected else "secondary"
+                    if st.button(f"📋 {label}", key=f"kb_{domain}_{f.stem}", use_container_width=True, type=btn_type):
+                        st.session_state[preview_key] = str(f)
+                        st.rerun()
 
             # Value sets
             if vs_files:
@@ -842,11 +886,13 @@ def _render_knowledge_base_tree():
                 )
                 for f in vs_files:
                     label = f.stem.replace("_values", "").replace("_", " ").title()
-                    if st.button(f"📊 {label}", key=f"kb_vs_{domain}_{f.stem}", use_container_width=True):
-                        st.session_state[f"kb_preview_{domain}"] = str(f)
+                    is_selected = str(f) == selected_path
+                    btn_type = "primary" if is_selected else "secondary"
+                    if st.button(f"📊 {label}", key=f"kb_vs_{domain}_{f.stem}", use_container_width=True, type=btn_type):
+                        st.session_state[preview_key] = str(f)
+                        st.rerun()
 
             # Preview pane
-            preview_key = f"kb_preview_{domain}"
             if preview_key in st.session_state and st.session_state[preview_key]:
                 preview_path = Path(st.session_state[preview_key])
                 if preview_path.exists():
@@ -867,11 +913,15 @@ def _render_knowledge_base_tree():
     # Top-level files
     if top_files:
         with st.expander(f"**System** — {len(top_files)} files", expanded=False):
+            sys_selected = st.session_state.get("kb_preview_system", "")
             for fname in top_files:
                 label = fname.replace(".md", "").replace("_", " ").title()
                 fpath = kb_path / fname
-                if st.button(f"⚙️ {label}", key=f"kb_sys_{fname}", use_container_width=True):
+                is_selected = str(fpath) == sys_selected
+                btn_type = "primary" if is_selected else "secondary"
+                if st.button(f"⚙️ {label}", key=f"kb_sys_{fname}", use_container_width=True, type=btn_type):
                     st.session_state["kb_preview_system"] = str(fpath)
+                    st.rerun()
 
             if "kb_preview_system" in st.session_state and st.session_state["kb_preview_system"]:
                 sys_path = Path(st.session_state["kb_preview_system"])
@@ -1322,12 +1372,6 @@ def render_provenance_tab(result: PipelineResult):
 
 def render_results(result: PipelineResult):
     """Render pipeline results with branded card metrics and stoplight panel."""
-    # Show completed pipeline stepper above results
-    stage_order = ["INGEST", "MAP", "HARMONIZE", "QC", "REVIEW"]
-    st.markdown(
-        pipeline_stepper(stage_order, len(stage_order), failed=not result.success),
-        unsafe_allow_html=True,
-    )
     st.header("Results")
 
     # --- Row 1: Summary metric cards ---
@@ -1809,6 +1853,31 @@ def main():
                 result = run_pipeline(uploaded_file, trial_id, config, data_dict_file)
         else:
             st.info("Upload a file to begin")
+
+        # Stage indicators — always visible in the run section
+        stage_order = ["INGEST", "MAP", "HARMONIZE", "QC", "REVIEW"]
+
+        if st.session_state.pipeline_result is not None:
+            # Pipeline finished — show final state
+            st.markdown(
+                pipeline_stepper(
+                    stage_order,
+                    len(stage_order),
+                    failed=not st.session_state.pipeline_result.success,
+                ),
+                unsafe_allow_html=True,
+            )
+            status_label = "Pipeline complete" if st.session_state.pipeline_result.success else "Pipeline failed"
+            st.progress(1.0, text=status_label)
+        elif st.session_state.progress_log:
+            # Pipeline running — show live progress
+            render_progress()
+        else:
+            # No run yet — show pending stepper
+            st.markdown(
+                pipeline_stepper(stage_order, -1),
+                unsafe_allow_html=True,
+            )
 
     # Results section
     st.divider()
