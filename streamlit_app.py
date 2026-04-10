@@ -1134,8 +1134,10 @@ def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None
         try:
             if data_dict_file.name.endswith('.csv'):
                 dict_df = pd.read_csv(data_dict_file)
-            elif data_dict_file.name.endswith(('.xlsx', '.xls')):
-                dict_df = pd.read_excel(data_dict_file)
+            elif data_dict_file.name.endswith('.xlsx'):
+                dict_df = pd.read_excel(data_dict_file, engine="openpyxl")
+            elif data_dict_file.name.endswith('.xls'):
+                dict_df = pd.read_excel(data_dict_file, engine="xlrd")
             elif data_dict_file.name.endswith('.json'):
                 data_dict = json.load(data_dict_file)
             logger.info(f"Loaded dictionary file: {data_dict_file.name}")
