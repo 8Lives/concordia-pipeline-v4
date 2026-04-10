@@ -1639,7 +1639,8 @@ def render_results(result: PipelineResult):
         st.json(result.metadata)
 
 
-def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None):
+def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None,
+                  stepper_placeholder=None, progress_placeholder=None, status_placeholder=None):
     """Run the harmonization pipeline."""
     # Reset progress
     st.session_state.progress_log = []
@@ -1720,6 +1721,25 @@ def run_pipeline(uploaded_file, trial_id: str, config: dict, data_dict_file=None
             "message": message,
             "progress": progress
         })
+
+        # Update the stepper in col2 if placeholders were provided
+        if stepper_placeholder is not None:
+            stage_order = ["INGEST", "MAP", "HARMONIZE", "QC", "REVIEW"]
+            current_stage = stage.upper()
+            is_error = current_stage == "ERROR"
+            is_complete = current_stage in ("COMPLETE", "FINALIZE")
+
+            if is_complete:
+                current_idx = len(stage_order)
+            elif current_stage in stage_order:
+                current_idx = stage_order.index(current_stage)
+            else:
+                current_idx = 0
+
+            stepper_placeholder.markdown(
+                pipeline_stepper(stage_order, current_idx, failed=is_error),
+                unsafe_allow_html=True,
+            )
 
     # Create orchestrator — v4: spec-driven, domain-parameterized
     reset_settings()
@@ -1817,19 +1837,19 @@ def main():
             with st.expander("File Preview", expanded=True):
                 try:
                     if uploaded_file.name.endswith('.csv'):
-                        preview_df = pd.read_csv(uploaded_file, nrows=5)
+                        preview_df = pd.read_csv(uploaded_file, nrows=50)
                     elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-                        preview_df = pd.read_excel(uploaded_file, nrows=5)
+                        preview_df = pd.read_excel(uploaded_file, nrows=50)
                     elif uploaded_file.name.endswith('.sas7bdat'):
                         try:
                             import pyreadstat
                             preview_df, _ = pyreadstat.read_sas7bdat(uploaded_file)
-                            preview_df = preview_df.head(5)
+                            preview_df = preview_df.head(50)
                         except ImportError:
                             try:
                                 from sas7bdat import SAS7BDAT
                                 with SAS7BDAT(uploaded_file) as f:
-                                    preview_df = f.to_data_frame().head(5)
+                                    preview_df = f.to_data_frame().head(50)
                             except ImportError:
                                 st.warning("Install 'pyreadstat' to preview SAS files")
                                 preview_df = None
@@ -1837,8 +1857,8 @@ def main():
                         preview_df = None
 
                     if preview_df is not None:
-                        st.dataframe(preview_df, use_container_width=True)
-                        st.caption(f"Showing first 5 rows | {len(preview_df.columns)} columns")
+                        st.dataframe(preview_df, use_container_width=True, height=300)
+                        st.caption(f"Showing first {len(preview_df)} rows | {len(preview_df.columns)} columns")
 
                     # Reset file position for later reading
                     uploaded_file.seek(0)
@@ -1848,18 +1868,15 @@ def main():
     with col2:
         st.subheader("Run Pipeline")
 
-        if uploaded_file is not None:
-            if st.button("Start Harmonization", type="primary", use_container_width=True):
-                result = run_pipeline(uploaded_file, trial_id, config, data_dict_file)
-        else:
-            st.info("Upload a file to begin")
-
-        # Stage indicators — always visible in the run section
+        # Stage indicators — use st.empty() so they can be updated during execution
         stage_order = ["INGEST", "MAP", "HARMONIZE", "QC", "REVIEW"]
+        stepper_slot = st.empty()
+        progress_slot = st.empty()
+        status_slot = st.empty()
 
         if st.session_state.pipeline_result is not None:
             # Pipeline finished — show final state
-            st.markdown(
+            stepper_slot.markdown(
                 pipeline_stepper(
                     stage_order,
                     len(stage_order),
@@ -1868,16 +1885,32 @@ def main():
                 unsafe_allow_html=True,
             )
             status_label = "Pipeline complete" if st.session_state.pipeline_result.success else "Pipeline failed"
-            st.progress(1.0, text=status_label)
+            progress_slot.progress(1.0, text=status_label)
         elif st.session_state.progress_log:
-            # Pipeline running — show live progress
+            # Pipeline running — show live progress (fallback for rerenders)
             render_progress()
         else:
             # No run yet — show pending stepper
-            st.markdown(
+            stepper_slot.markdown(
                 pipeline_stepper(stage_order, -1),
                 unsafe_allow_html=True,
             )
+
+        if uploaded_file is not None:
+            if st.button("Start Harmonization", type="primary", use_container_width=True):
+                # Show "running" state immediately
+                stepper_slot.markdown(
+                    pipeline_stepper(stage_order, 0),
+                    unsafe_allow_html=True,
+                )
+                result = run_pipeline(
+                    uploaded_file, trial_id, config, data_dict_file,
+                    stepper_placeholder=stepper_slot,
+                    progress_placeholder=progress_slot,
+                    status_placeholder=status_slot,
+                )
+        else:
+            st.info("Upload a file to begin")
 
     # Results section
     st.divider()
