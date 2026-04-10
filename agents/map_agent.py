@@ -273,14 +273,16 @@ class MapAgent(AgentBase):
                 result["details"]["warning"] = "Low uniqueness ratio - verify mapping"
 
         else:
-            heuristic_col = find_subject_id_heuristic(df, SUBJID_EXCLUSIONS)
-            if heuristic_col:
+            heuristic_result = find_subject_id_heuristic(df, SUBJID_EXCLUSIONS)
+            if heuristic_result:
+                heuristic_col, heuristic_reason = heuristic_result
                 result["source_column"] = heuristic_col
                 result["operation"] = "Copy"
                 result["non_null_count"] = int(df[heuristic_col].notna().sum())
                 result["null_count"] = int(df[heuristic_col].isna().sum())
                 result["details"] = {
                     "matched_via": "heuristic",
+                    "heuristic_reason": heuristic_reason,
                     "warning": "Mapped using uniqueness heuristic - verify correct column"
                 }
             else:
