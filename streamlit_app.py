@@ -1161,26 +1161,42 @@ def create_transformation_report_docx(result: PipelineResult) -> bytes:
     # Variable Transformation Table
     doc.add_heading('2. Variable-Level Transformations', level=1)
 
+    # Build per-variable confidence summary from provenance for DOCX
+    var_confidence_docx = {}
+    if result.provenance_df is not None and len(result.provenance_df) > 0 and 'mapping_confidence' in result.provenance_df.columns:
+        for var_name, group in result.provenance_df.groupby('variable'):
+            counts = group['mapping_confidence'].value_counts().to_dict()
+            total = len(group)
+            dominant = max(counts, key=counts.get) if counts else "—"
+            dist_parts = []
+            for level in ["HIGH", "MEDIUM", "LOW", "UNMAPPED"]:
+                if level in counts:
+                    pct = counts[level] / total * 100
+                    dist_parts.append(f"{level}: {pct:.0f}%")
+            var_confidence_docx[var_name] = dominant + " (" + ", ".join(dist_parts) + ")" if dist_parts else "—"
+
     if result.lineage:
-        trans_table = doc.add_table(rows=1, cols=7)
+        trans_table = doc.add_table(rows=1, cols=8)
         trans_table.style = 'Table Grid'
 
-        headers = ['Variable', 'Source', 'Operation', 'Details', 'Changed', '%', 'Missing']
+        headers = ['Variable', 'Source', 'Operation', 'Details', 'Confidence', 'Changed', '%', 'Missing']
         hdr_cells = trans_table.rows[0].cells
         for i, header in enumerate(headers):
             hdr_cells[i].text = header
 
         for entry in result.lineage:
             row_cells = trans_table.add_row().cells
-            row_cells[0].text = str(entry.get('variable', ''))
+            var_name = str(entry.get('variable', ''))
+            row_cells[0].text = var_name
             source_col = entry.get('source_column', '') or ''
             row_cells[1].text = str(source_col) if source_col else '(derived)'
             row_cells[2].text = str(entry.get('mapping_operation', 'Copy'))
             transform_op = entry.get('transform_operation', '') or entry.get('transformation', 'None')
             row_cells[3].text = str(transform_op)[:50]
-            row_cells[4].text = str(entry.get('rows_changed', 0))
-            row_cells[5].text = f"{entry.get('percent_changed', 0):.1f}%"
-            row_cells[6].text = str(entry.get('missing_count', 0))
+            row_cells[4].text = var_confidence_docx.get(var_name, "—")
+            row_cells[5].text = str(entry.get('rows_changed', 0))
+            row_cells[6].text = f"{entry.get('percent_changed', 0):.1f}%"
+            row_cells[7].text = str(entry.get('missing_count', 0))
 
     # QC Report Section
     doc.add_heading('3. QC Report', level=1)
@@ -1479,14 +1495,36 @@ def render_results(result: PipelineResult):
     with tabs[4]:
         st.subheader("Variable Transformations")
         if result.lineage:
+            # Build per-variable confidence summary from provenance
+            var_confidence = {}
+            if result.provenance_df is not None and len(result.provenance_df) > 0 and 'mapping_confidence' in result.provenance_df.columns:
+                for var_name, group in result.provenance_df.groupby('variable'):
+                    counts = group['mapping_confidence'].value_counts().to_dict()
+                    total = len(group)
+                    # Dominant confidence = most frequent
+                    dominant = max(counts, key=counts.get) if counts else "—"
+                    # Build compact distribution string: "HIGH: 95%, MEDIUM: 5%"
+                    dist_parts = []
+                    for level in ["HIGH", "MEDIUM", "LOW", "UNMAPPED"]:
+                        if level in counts:
+                            pct = counts[level] / total * 100
+                            dist_parts.append(f"{level}: {pct:.0f}%")
+                    var_confidence[var_name] = {
+                        "dominant": dominant,
+                        "distribution": ", ".join(dist_parts) if dist_parts else "—",
+                    }
+
             lineage_data = []
             for entry in result.lineage:
+                var_name = entry.get("variable", "")
+                conf_info = var_confidence.get(var_name, {})
                 lineage_data.append({
-                    "variable": entry.get("variable", ""),
+                    "variable": var_name,
                     "source_column": entry.get("source_column", "") or "(derived)",
                     "mapping_operation": entry.get("mapping_operation", ""),
                     "transform_operation": entry.get("transform_operation", "") or entry.get("transformation", ""),
-                    "transform_details": str(entry.get("transform_details", {})),
+                    "confidence": conf_info.get("dominant", "—"),
+                    "confidence_dist": conf_info.get("distribution", "—"),
                     "rows_changed": entry.get("rows_changed", 0),
                     "percent_changed": f"{entry.get('percent_changed', 0):.1f}%",
                     "missing_count": entry.get("missing_count", 0),
