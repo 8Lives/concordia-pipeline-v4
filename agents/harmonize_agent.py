@@ -424,9 +424,9 @@ class HarmonizeAgent(AgentBase):
             # Already resolvable without LLM?
             if val_norm in dict_codes or val_norm.upper() in dict_codes:
                 continue
-            if val_lower in synonym_lookup:
-                continue
             if val_lower in allowed_lower:
+                continue
+            if val_lower in synonym_lookup:
                 continue
             # Fuzzy synonym match (slash→or, parenthetical strip, etc.)
             if self._fuzzy_synonym_match(val_lower, synonym_lookup, allowed_lower):
@@ -480,22 +480,22 @@ class HarmonizeAgent(AgentBase):
                 harmonized = to_mixed_case(decoded)
                 confidence = "HIGH"
 
-            # 2. Synonym lookup
+            # 2. Direct match to allowed values (highest non-dictionary confidence)
+            if harmonized is None and val_lower in allowed_lower:
+                harmonized = allowed_lower[val_lower]
+                confidence = "HIGH"
+
+            # 3. Synonym lookup
             if harmonized is None and val_lower in synonym_lookup:
                 harmonized = synonym_lookup[val_lower]
                 confidence = "MEDIUM"
 
-            # 2b. Fuzzy synonym match (slash→or, strip parens, Alaskan→Alaska)
+            # 3b. Fuzzy synonym match (slash→or, strip parens, Alaskan→Alaska)
             if harmonized is None:
                 fuzzy_result = self._fuzzy_synonym_match(val_lower, synonym_lookup, allowed_lower)
                 if fuzzy_result:
                     harmonized = fuzzy_result
                     confidence = "MEDIUM"
-
-            # 3. Direct match to allowed values
-            if harmonized is None and val_lower in allowed_lower:
-                harmonized = allowed_lower[val_lower]
-                confidence = "HIGH"
 
             # 3b. Terminology lookup (MedDRA for AE, no-op for DM)
             if harmonized is None:
@@ -561,6 +561,42 @@ class HarmonizeAgent(AgentBase):
         return result_series, lineage
 
     # ------------------------------------------------------------------
+    # Provenance helper for non-coded variables
+    # ------------------------------------------------------------------
+
+    def _record_simple_provenance(
+        self,
+        df: pd.DataFrame,
+        variable: str,
+        result_series: pd.Series,
+        lineage: Dict,
+        confidence: str = "HIGH",
+    ):
+        """Record provenance for non-coded variables (TRIAL, SUBJID, dates, etc.).
+
+        These variables don't go through the coded resolution chain, so their
+        confidence is determined by the transform type:
+        - HIGH: direct passthrough, constant assignment, or deterministic transform
+        - MEDIUM: derived from other columns (e.g., USUBJID from STUDYID+SUBJID)
+        - UNMAPPED: null/missing values
+        """
+        source_col = lineage.get("source_column") or variable
+        for idx in df.index:
+            raw = df.at[idx, variable] if variable in df.columns else None
+            harmonized = result_series.get(idx)
+            row_conf = confidence
+            if pd.isna(harmonized) or harmonized is None:
+                row_conf = "UNMAPPED"
+            self.provenance.record(
+                variable=variable,
+                source_dataset_id=str(df.at[idx, "TRIAL"]) if "TRIAL" in df.columns and pd.notna(df.at[idx, "TRIAL"]) else "",
+                source_field_name=source_col,
+                source_value_raw=str(raw) if pd.notna(raw) else "",
+                harmonized_value=str(harmonized) if pd.notna(harmonized) else "",
+                mapping_confidence=row_conf,
+            )
+
+    # ------------------------------------------------------------------
     # Variable-specific handlers
     # ------------------------------------------------------------------
 
@@ -576,6 +612,7 @@ class HarmonizeAgent(AgentBase):
                 lambda x: str(x).strip().upper() if pd.notna(x) else None
             )
             lineage["transform_operation"] = "Normalize (uppercase, trim)"
+        self._record_simple_provenance(df, "TRIAL", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_subjid(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -588,6 +625,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df["SUBJID"].apply(clean_subjid)
         lineage["transform_operation"] = "Trim, convert floats to strings"
+        self._record_simple_provenance(df, "SUBJID", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_age(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -616,6 +654,24 @@ class HarmonizeAgent(AgentBase):
 
         result = df.apply(clean_age, axis=1)
         lineage["transform_operation"] = "Convert to numeric, derive from dates if missing"
+        # AGE: HIGH if direct from source, MEDIUM if derived from dates
+        for idx in df.index:
+            raw_age = df.at[idx, "AGE"] if "AGE" in df.columns else None
+            harmonized = result.get(idx)
+            if pd.isna(harmonized) or harmonized is None:
+                conf = "UNMAPPED"
+            elif pd.notna(raw_age):
+                conf = "HIGH"
+            else:
+                conf = "MEDIUM"  # derived from BRTHDTC/RFSTDTC
+            self.provenance.record(
+                variable="AGE",
+                source_dataset_id=str(df.at[idx, "TRIAL"]) if "TRIAL" in df.columns and pd.notna(df.at[idx, "TRIAL"]) else "",
+                source_field_name=lineage.get("source_column") or "AGE",
+                source_value_raw=str(raw_age) if pd.notna(raw_age) else "",
+                harmonized_value=str(harmonized) if pd.notna(harmonized) else "",
+                mapping_confidence=conf,
+            )
         return result, lineage
 
     def _harmonize_ageu(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -627,6 +683,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df.apply(clean_ageu, axis=1)
         lineage["transform_operation"] = "Standardize to 'Years'"
+        self._record_simple_provenance(df, "AGEU", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_agegp(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -644,6 +701,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df.apply(clean_agegp, axis=1)
         lineage["transform_operation"] = "Preserve if AGE missing, blank otherwise"
+        self._record_simple_provenance(df, "AGEGP", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_country(
@@ -667,6 +725,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df["COUNTRY"].apply(harmonize_country)
         lineage["transform_operation"] = "Expand ISO codes, normalize to mixed case"
+        self._record_simple_provenance(df, "COUNTRY", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_siteid(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -685,6 +744,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df["SITEID"].apply(clean_siteid)
         lineage["transform_operation"] = "Preserve as string"
+        self._record_simple_provenance(df, "SITEID", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_studyid(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -692,6 +752,7 @@ class HarmonizeAgent(AgentBase):
             lambda x: str(x).strip() if pd.notna(x) else None
         )
         lineage["transform_operation"] = "Trim whitespace"
+        self._record_simple_provenance(df, "STUDYID", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_usubjid(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -715,6 +776,24 @@ class HarmonizeAgent(AgentBase):
 
         result = df.apply(derive_usubjid, axis=1)
         lineage["transform_operation"] = "Derive as STUDYID||'-'||SUBJID if not present"
+        # USUBJID: HIGH if from source, MEDIUM if derived
+        for idx in df.index:
+            raw = df.at[idx, "USUBJID"] if "USUBJID" in df.columns else None
+            harmonized = result.get(idx)
+            if pd.isna(harmonized) or harmonized is None:
+                conf = "UNMAPPED"
+            elif pd.notna(raw):
+                conf = "HIGH"
+            else:
+                conf = "MEDIUM"  # derived from STUDYID + SUBJID
+            self.provenance.record(
+                variable="USUBJID",
+                source_dataset_id=str(df.at[idx, "TRIAL"]) if "TRIAL" in df.columns and pd.notna(df.at[idx, "TRIAL"]) else "",
+                source_field_name=lineage.get("source_column") or "USUBJID",
+                source_value_raw=str(raw) if pd.notna(raw) else "",
+                harmonized_value=str(harmonized) if pd.notna(harmonized) else "",
+                mapping_confidence=conf,
+            )
         return result, lineage
 
     def _harmonize_arm(
@@ -733,6 +812,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df[variable].apply(harmonize_arm)
         lineage["transform_operation"] = "Decode codes, normalize to mixed case"
+        self._record_simple_provenance(df, variable, result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_date(
@@ -760,6 +840,7 @@ class HarmonizeAgent(AgentBase):
 
         result = df[variable].apply(clean_date)
         lineage["transform_operation"] = "Convert SAS dates to ISO 8601"
+        self._record_simple_provenance(df, variable, result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_domain(self, df: pd.DataFrame, lineage: Dict) -> Tuple[pd.Series, Dict]:
@@ -768,6 +849,7 @@ class HarmonizeAgent(AgentBase):
             domain_code = self.spec_registry.domain
         result = pd.Series([domain_code] * len(df), index=df.index)
         lineage["transform_operation"] = f"Constant '{domain_code}'"
+        self._record_simple_provenance(df, "DOMAIN", result, lineage, "HIGH")
         return result, lineage
 
     def _harmonize_default(
@@ -777,6 +859,7 @@ class HarmonizeAgent(AgentBase):
             lambda x: normalize_whitespace(str(x)) if pd.notna(x) else None
         )
         lineage["transform_operation"] = "Normalize whitespace"
+        self._record_simple_provenance(df, variable, result, lineage, "HIGH")
         return result, lineage
 
     # ------------------------------------------------------------------
